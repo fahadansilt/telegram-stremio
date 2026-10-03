@@ -106,6 +106,11 @@ class Telegram:
         if override:
             parsed["imdb_id"] = override
         imdb_id, meta = await self.metadata.match(parsed)
+        meta["type"] = parsed.get("type", "movie")
+        if parsed.get("season") is not None:
+            meta["season"] = parsed["season"]
+        if parsed.get("episode") is not None:
+            meta["episode"] = parsed["episode"]
         await self.db.upsert({
             "chat_id": chat_id, "message_id": message.id, "document_id": document.id,
             "filename": filename, "size": document.size,
@@ -113,6 +118,7 @@ class Telegram:
             "title": parsed["title"], "year": parsed["year"], "quality": parsed["quality"],
             "caption": message.raw_text or "", "imdb_id": imdb_id, "metadata": json.dumps(meta),
             "posted_at": message.date.isoformat(),
+            "media_type": parsed["type"], "season": parsed["season"], "episode": parsed["episode"],
         })
 
     async def sync(self, full: bool = False):

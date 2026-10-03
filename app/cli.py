@@ -35,12 +35,14 @@ async def run(args):
         if args.command == "map":
             if not IMDB.fullmatch(args.imdb_id):
                 raise ValueError("Expected an IMDb ID such as tt0133093")
-            if not await db.get_file(args.chat_id, args.message_id):
+            record = await db.get_file(args.chat_id, args.message_id)
+            if not record:
                 raise ValueError("Index this Telegram message before mapping it")
             await db.set_override(
-                args.chat_id, args.message_id, args.imdb_id, await metadata.get(args.imdb_id)
+                args.chat_id, args.message_id, args.imdb_id,
+                await metadata.get(args.imdb_id, record["media_type"])
             )
-            print("Mapping saved; regular Stremio movie pages can now find this file")
+            print("Mapping saved; regular Stremio pages can now find this file")
         elif args.command == "unmatched":
             rows = await db.execute(
                 "SELECT chat_id, message_id, filename FROM files "

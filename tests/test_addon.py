@@ -11,7 +11,7 @@ from tests.fakes import FakeTelegram, record
 async def test_manifest_catalog_meta_and_imdb_streams(service):
     manifest = (await service.http.get("/manifest.json")).json()
     assert manifest["catalogs"][0]["id"] == "telegram"
-    assert manifest["resources"][2]["idPrefixes"] == ["tg:", "tt"]
+    assert manifest["resources"][2]["idPrefixes"] == ["tg:", "tgseries:", "tt"]
     catalog = (await service.http.get("/catalog/movie/telegram.json")).json()
     item = catalog["metas"][0]
     assert item["id"] == "tg:-1001234567890:456"

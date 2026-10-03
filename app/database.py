@@ -5,6 +5,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from app.media import episode_number, series_key
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     chat_id INTEGER NOT NULL,
@@ -20,6 +22,10 @@ CREATE TABLE IF NOT EXISTS files (
     imdb_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     posted_at TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'movie',
+    season INTEGER,
+    episode INTEGER,
+    series_key TEXT,
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS files_imdb ON files(imdb_id);
@@ -54,7 +60,47 @@ class Database:
         await self.connection.execute("PRAGMA journal_mode=WAL")
         await self.connection.execute("PRAGMA busy_timeout=5000")
         await self.connection.executescript(SCHEMA)
+        await self.migrate()
         await self.connection.commit()
+
+    async def migrate(self):
+        async with self.connection.execute("PRAGMA table_info(files)") as cursor:
+            columns = {row["name"] for row in await cursor.fetchall()}
+        for name, definition in {
+            "media_type": "TEXT NOT NULL DEFAULT 'movie'", "season": "INTEGER",
+            "episode": "INTEGER", "series_key": "TEXT",
+        }.items():
+            if name not in columns:
+                await self.connection.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
+        async with self.connection.execute("PRAGMA user_version") as cursor:
+            version = (await cursor.fetchone())[0]
+        if version < 2:
+            # Preserve episode metadata written by the earlier partial series
+            # implementation, without needing SQLite's optional JSON extension.
+            async with self.connection.execute(
+                "SELECT chat_id,message_id,title,year,imdb_id,metadata FROM files"
+            ) as cursor:
+                async for row in cursor:
+                    try:
+                        meta = json.loads(row["metadata"])
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(meta, dict) or meta.get("type") != "series":
+                        continue
+                    season = meta.get("season", 1)
+                    episode = meta.get("episode")
+                    valid = episode_number(season) and episode_number(episode)
+                    await self.connection.execute(
+                        "UPDATE files SET media_type='series',season=?,episode=?,series_key=? "
+                        "WHERE chat_id=? AND message_id=?",
+                        (season if valid else None, episode if valid else None,
+                         series_key(row["title"], row["year"], row["imdb_id"]),
+                         row["chat_id"], row["message_id"]),
+                    )
+            await self.connection.execute("PRAGMA user_version=2")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS files_series ON files(series_key,season,episode)"
+        )
 
     async def close(self):
         await self.connection.close()
@@ -67,6 +113,14 @@ class Database:
             return [dict(row) for row in rows]
 
     async def upsert(self, record: dict):
+        record = dict(record)
+        record.setdefault("media_type", "movie")
+        record.setdefault("season", None)
+        record.setdefault("episode", None)
+        record["series_key"] = (
+            series_key(record["title"], record["year"], record["imdb_id"])
+            if record["media_type"] == "series" else None
+        )
         # The caller owns the column names, while all message content is parameterized.
         columns = list(record)
         updates = ", ".join(f"{key}=excluded.{key}" for key in columns)
@@ -115,6 +169,11 @@ class Database:
             "UPDATE files SET imdb_id=?, metadata=? WHERE chat_id=? AND message_id=?",
             (imdb_id, json.dumps(meta), chat_id, message_id),
         )
+        await self.execute(
+            "UPDATE files SET series_key=? WHERE chat_id=? AND message_id=? "
+            "AND media_type='series'",
+            (imdb_id, chat_id, message_id),
+        )
 
     async def cache_get(self, key: str) -> dict | None:
         rows = await self.execute(
@@ -129,21 +188,57 @@ class Database:
             (key, json.dumps(value), time.time() + ttl),
         )
 
-    async def catalog(self, allowed: list[int], search: str, skip: int) -> list[dict]:
+    async def catalog(
+        self, allowed: list[int], search: str, skip: int, media_type: str = "movie"
+    ) -> list[dict]:
         if not allowed:
             return []
         pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        return await self.execute(
+        query = (
             f"SELECT * FROM files WHERE chat_id IN ({','.join('?' for _ in allowed)}) "
+            "AND media_type=? "
             "AND (title LIKE ? ESCAPE '\\' OR filename LIKE ? ESCAPE '\\') "
-            "ORDER BY posted_at DESC, chat_id, message_id DESC LIMIT 100 OFFSET ?",
-            (*allowed, pattern, pattern, skip),
         )
+        if media_type == "series":
+            query = (
+                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY series_key "
+                "ORDER BY posted_at DESC,chat_id,message_id DESC) AS group_rank FROM ("
+                + query + " AND season IS NOT NULL AND episode IS NOT NULL)) WHERE group_rank=1 "
+            )
+        query += "ORDER BY posted_at DESC, chat_id, message_id DESC LIMIT 100 OFFSET ?"
+        return await self.execute(query, (*allowed, media_type, pattern, pattern, skip))
 
-    async def by_imdb(self, imdb_id: str, allowed: list[int]) -> list[dict]:
+    async def by_imdb(
+        self, imdb_id: str, allowed: list[int], media_type: str = "movie",
+        season: int | None = None, episode: int | None = None,
+    ) -> list[dict]:
         if not allowed:
             return []
+        query = (
+            f"SELECT * FROM files WHERE imdb_id=? AND media_type=? AND chat_id IN "
+            f"({','.join('?' for _ in allowed)})"
+        )
+        params = (imdb_id, media_type, *allowed)
+        if season is not None and episode is not None:
+            query += " AND season=? AND episode=?"
+            params += (season, episode)
+        return await self.execute(query + " ORDER BY size DESC", params)
+
+    async def series_files(
+        self, key: str, allowed: list[int],
+        season: int | None = None, episode: int | None = None,
+    ) -> list[dict]:
+        if not allowed:
+            return []
+        query = (
+            "SELECT * FROM files WHERE series_key=? AND media_type='series' "
+            f"AND chat_id IN ({','.join('?' for _ in allowed)}) "
+            "AND season IS NOT NULL AND episode IS NOT NULL"
+        )
+        params = (key, *allowed)
+        if season is not None and episode is not None:
+            query += " AND season=? AND episode=?"
+            params += (season, episode)
         return await self.execute(
-            f"SELECT * FROM files WHERE imdb_id=? AND chat_id IN "
-            f"({','.join('?' for _ in allowed)}) ORDER BY size DESC", (imdb_id, *allowed)
+            query + " ORDER BY season,episode,size DESC,posted_at DESC", params
         )

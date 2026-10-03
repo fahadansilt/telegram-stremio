@@ -1,7 +1,7 @@
 # Telegram → Stremio
 
 A FastAPI addon and HTTP byte-range server backed by a Telethon **user session**.
-It indexes movie videos in selected Telegram channels/groups and proxies the
+It indexes movies and TV episodes in selected Telegram channels/groups and proxies the
 original MKV/MP4 file directly to Stremio. No transcoding or full-file download.
 
 ```text
@@ -82,7 +82,7 @@ to `"8000:8000"`, then recreate the service. Local plain HTTP is intended for
 desktop/native testing; Stremio Web expects HTTPS, and browser playback depends
 on codec support. The addon marks original files `notWebReady` conservatively.
 
-## Movie discovery and IMDb matching
+## Movie and series discovery and IMDb matching
 
 - The initial scan covers the latest `HISTORY_LIMIT` **messages** per source
   (default 1000). Set `0` to scan all accessible history.
@@ -92,9 +92,11 @@ on codec support. The addon marks original files `notWebReady` conservatively.
   Deletions with known chat IDs are handled live. Older edits/deletions missed
   while offline are discovered when played or by a full reindex; a deleted file
   returns 404, and changed media returns 409 until its index entry refreshes.
-- Movie filenames are parsed with GuessIt. Detected TV episode files are skipped;
-  this first version implements movies. Archives and external video links are
-  not playable files in this index.
+- Filenames are parsed with GuessIt. Movies and individual TV episodes are
+  indexed. Formats such as `Show.S01E02.1080p.mkv` and `Show.1x02.mp4` are supported.
+  `Show.E02.mp4` defaults to season 1; `S00E01` preserves season 0 for specials.
+  Archives, season packs, and combined files such as `S01E01E02` are skipped
+  because they do not identify one playable Stremio episode unambiguously.
 - A single `tt...` IMDb ID in the filename/caption wins over automatic matching.
   **Manual mappings have highest priority** and survive reindexing.
 - Otherwise, Cinemeta is searched using the parsed title. Only a unique exact
@@ -107,6 +109,49 @@ on codec support. The addon marks original files `notWebReady` conservatively.
 - The Telegram catalog has stable IDs like `tg:-1001234567890:456`. It supports
   search and pages of 100 items. Files with the same IMDb mapping appear as
   alternative streams, ordered by labeled resolution and then file size.
+
+### Telegram Series catalog
+
+Select **Discover → Series → Telegram Series**. Each show appears once, with
+the seasons/episodes that have actually been indexed. Different resolutions or
+copies of the same episode appear as alternative streams for that episode.
+
+Matched shows group by their IMDb series ID. Unmatched shows group by normalized
+title and year and remain playable through the Telegram Series catalog. Series
+IDs use `tgseries:tt0944947` or `tgseries:<title/year-hash>`; episode IDs append
+`:season:episode`, for example `tgseries:tt0944947:1:2`.
+
+Regular Stremio series pages use IMDb episode IDs such as `tt0944947:1:2`. Only
+files matching both that season and episode are returned. Movie requests never
+include TV episodes. Episode metadata's `released` field uses the Telegram upload
+date, and available episodes are derived from the index rather than a complete
+external episode guide.
+
+For manual episode mappings, the existing `map` command detects the indexed
+file's type and fetches the appropriate series metadata. Mappings apply to the
+specified message and survive reindexing:
+
+```sh
+docker compose run --rm addon python -m app.cli map --chat-id=-1001234567890 --message-id=789 --imdb-id=tt0944947
+```
+
+### Upgrading from the movie-only version
+
+Version 1.1.0 automatically adds series columns to the existing SQLite database
+and preserves the movie index, session, checkpoints, and manual mappings.
+Once the updated source is on your server, rebuild and scan history to discover
+episodes previously skipped by the movie-only parser:
+
+```sh
+docker compose build addon
+docker compose stop addon
+docker compose run --rm addon python -m app.cli sync --full
+docker compose up -d addon
+```
+
+Remove and reinstall the addon in Stremio to refresh its manifest, which now
+advertises both movie and series catalogs. Print the current installation URL
+with `docker compose exec addon python -m app.cli url`.
 
 ### Full scan and manual mappings
 
@@ -137,11 +182,15 @@ GET       /catalog/movie/telegram/search=The%20Matrix&skip=0.json
 GET       /meta/movie/tg:-1001234567890:456.json
 GET       /stream/movie/tg:-1001234567890:456.json
 GET       /stream/movie/tt0133093.json
+GET       /catalog/series/telegram.json
+GET       /meta/series/tgseries:tt0944947.json
+GET       /stream/series/tgseries:tt0944947:1:2.json
+GET       /stream/series/tt0944947:1:2.json
 GET, HEAD /video/-1001234567890/456
 GET       /health
 ```
 
-Video requests require a configured chat and an indexed movie message. The server
+Video requests require a configured chat and an indexed movie or episode message. The server
 refetches the message to obtain current file references and validate document ID
 and size. A stream response contains an absolute URL based on `PUBLIC_BASE_URL`.
 
@@ -238,6 +287,7 @@ python -m ruff check app tests
 
 Tests use simulated Telegram documents and HTTP requests; they exercise seeking,
 range boundaries, cleanup, reference renewal, authenticated CDN reads, indexing
-checkpoints, IMDb matching, and addon responses without a Telegram account.
+checkpoints, movie/series IMDb matching, schema migration, episode isolation,
+series grouping, and addon responses without a Telegram account.
 Actual Telegram playback and Stremio-device codec compatibility require your
 configured session and a real video.

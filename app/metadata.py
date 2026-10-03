@@ -1,25 +1,25 @@
 import logging
 import re
-import unicodedata
 from urllib.parse import quote
 
 import httpx
 from guessit import guessit
 
 from app.database import Database
+from app.media import episode_number, normalize
 
 log = logging.getLogger(__name__)
 IMDB = re.compile(r"\btt\d{7,10}\b")
 
 
-def normalize(value: str) -> str:
-    text = unicodedata.normalize("NFKD", value).casefold()
-    return "".join(char for char in text if char.isalnum())
-
-
 def parse_filename(filename: str, caption: str) -> dict | None:
     parsed = guessit(filename)
-    if parsed.get("type") == "episode" or parsed.get("episode") is not None:
+    is_series = parsed.get("type") == "episode" or parsed.get("episode") is not None
+    season = parsed.get("season", 1) if is_series else None
+    episode = parsed.get("episode") if is_series else None
+    # A season pack or combined-episode file cannot be mapped unambiguously to
+    # one Stremio episode. Avoid indexing lists as SQLite integers or movie files.
+    if is_series and not (episode_number(season) and episode_number(episode)):
         return None
     title = parsed.get("title")
     if not title:
@@ -30,6 +30,9 @@ def parse_filename(filename: str, caption: str) -> dict | None:
     return {
         "title": str(title), "year": parsed.get("year"), "quality": quality,
         "imdb_id": next(iter(ids)) if len(ids) == 1 else None,
+        "type": "series" if is_series else "movie",
+        "season": season,
+        "episode": episode,
     }
 
 
@@ -58,10 +61,10 @@ class Metadata:
         await self.db.cache_set(path, value)
         return value
 
-    async def get(self, imdb_id: str) -> dict:
+    async def get(self, imdb_id: str, media_type: str = "movie") -> dict:
         if not self.enabled:
             return {}
-        value = await self.request(f"meta/movie/{imdb_id}.json")
+        value = await self.request(f"meta/{media_type}/{imdb_id}.json")
         meta = value.get("meta") or {}
         # Store descriptive fields only; playback always uses our own IDs and routes.
         return {key: meta[key] for key in (
@@ -70,12 +73,13 @@ class Metadata:
 
     async def match(self, parsed: dict) -> tuple[str | None, dict]:
         imdb_id = parsed["imdb_id"]
+        media_type = parsed.get("type", "movie")
         if imdb_id:
-            return imdb_id, await self.get(imdb_id)
+            return imdb_id, await self.get(imdb_id, media_type)
         if not self.enabled:
             return None, {}
         result = await self.request(
-            f"catalog/movie/top/search={quote(parsed['title'], safe='')}.json"
+            f"catalog/{media_type}/top/search={quote(parsed['title'], safe='')}.json"
         )
         matches = {}
         for candidate in result.get("metas", []):
@@ -91,5 +95,5 @@ class Metadata:
         # Never select the first fuzzy search result or silently choose between remakes.
         if len(matches) == 1:
             imdb_id = next(iter(matches))
-            return imdb_id, await self.get(imdb_id)
+            return imdb_id, await self.get(imdb_id, media_type)
         return None, {}

@@ -16,44 +16,58 @@ async def fresh_addon_response(response: Response):
 
 router = APIRouter(dependencies=[Depends(fresh_addon_response)])
 LOCAL_ID = re.compile(r"tg:(-\d+):(\d+)")
+SERIES_KEY_PATTERN = r"(?:tt\d{7,10}|[a-f0-9]{32})"
+LOCAL_SERIES_ID = re.compile(rf"tgseries:({SERIES_KEY_PATTERN})")
+LOCAL_EPISODE_ID = re.compile(rf"tgseries:({SERIES_KEY_PATTERN}):([0-9]{{1,4}}):([0-9]{{1,4}})")
+IMDB_EPISODE_ID = re.compile(r"(tt\d{7,10}):([0-9]{1,4}):([0-9]{1,4})")
 
 
 def local_id(record: dict) -> str:
+    if record.get("media_type") == "series":
+        return f"tgseries:{record['series_key']}"
     return f"tg:{record['chat_id']}:{record['message_id']}"
 
 
 def meta_for(record: dict) -> dict:
     meta = json.loads(record["metadata"])
-    meta.update({"id": local_id(record), "type": "movie"})
+    media_type = record.get("media_type", "movie")
+    meta.update({"id": local_id(record), "type": media_type})
+    meta.pop("season", None)
+    meta.pop("episode", None)
     meta.setdefault("name", record["title"])
     meta.setdefault("description", record["caption"] or record["filename"])
     if record["year"]:
         meta.setdefault("releaseInfo", str(record["year"]))
     # Never inherit Cinemeta's default IMDb video ID for our custom catalog items.
-    meta["behaviorHints"] = {"defaultVideoId": local_id(record)}
+    meta["behaviorHints"] = {"defaultVideoId": local_id(record)} if media_type == "movie" else {}
     return meta
 
 
 @router.get("/manifest.json")
 async def manifest(request: Request):
     return {
-        "id": "org.telegram.movies", "version": "1.0.2",
+        "id": "org.telegram.movies", "version": "1.1.0",
         "name": request.app.state.settings.addon_name,
-        "description": "Play original videos from your selected Telegram channels and groups.",
-        "types": ["movie"],
+        "description": "Play movies and TV episodes from your selected Telegram channels/groups.",
+        "types": ["movie", "series"],
         "resources": [
-            "catalog", {"name": "meta", "types": ["movie"], "idPrefixes": ["tg:"]},
-            {"name": "stream", "types": ["movie"], "idPrefixes": ["tg:", "tt"]},
+            "catalog", {"name": "meta", "types": ["movie", "series"],
+                        "idPrefixes": ["tg:", "tgseries:"]},
+            {"name": "stream", "types": ["movie", "series"],
+             "idPrefixes": ["tg:", "tgseries:", "tt"]},
         ],
-        "catalogs": [{"type": "movie", "id": "telegram", "name": "Telegram Movies",
-                      "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}]}],
+        "catalogs": [
+            {"type": media_type, "id": "telegram", "name": name,
+             "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}]}
+            for media_type, name in (("movie", "Telegram Movies"), ("series", "Telegram Series"))
+        ],
     }
 
 
 @router.get("/catalog/{media_type}/{catalog_id}.json")
 @router.get("/catalog/{media_type}/{catalog_id}/{extra:path}.json")
 async def catalog(request: Request, media_type: str, catalog_id: str, extra: str = ""):
-    if media_type != "movie" or catalog_id != "telegram":
+    if media_type not in {"movie", "series"} or catalog_id != "telegram":
         return {"metas": []}
     # Parse the encoded path so escaped '&', '=', '+', '%' and '/' in titles
     # remain values rather than becoming separators after ASGI path decoding.
@@ -67,42 +81,77 @@ async def catalog(request: Request, media_type: str, catalog_id: str, extra: str
     except ValueError as exc:
         raise HTTPException(400, "skip must be a non-negative integer") from exc
     records = await request.app.state.db.catalog(
-        request.app.state.telegram.allowed_chats, params.get("search", ""), skip
+        request.app.state.telegram.allowed_chats, params.get("search", ""), skip, media_type
     )
     return {"metas": [meta_for(record) for record in records]}
 
 
-async def lookup_local(request: Request, item_id: str):
+async def lookup_local(request: Request, item_id: str, media_type: str = "movie"):
     match = LOCAL_ID.fullmatch(item_id)
     if not match:
         return None
     chat_id, message_id = map(int, match.groups())
     if chat_id not in request.app.state.telegram.allowed_chats:
         return None
-    return await request.app.state.db.get_file(chat_id, message_id)
+    record = await request.app.state.db.get_file(chat_id, message_id)
+    return record if record and record["media_type"] == media_type else None
 
 
 @router.get("/meta/{media_type}/{item_id}.json")
 async def meta(request: Request, media_type: str, item_id: str):
+    if media_type == "series":
+        match = LOCAL_SERIES_ID.fullmatch(item_id)
+        records = await request.app.state.db.series_files(
+            match[1], request.app.state.telegram.allowed_chats
+        ) if match else []
+        if not records:
+            raise HTTPException(404, "Series not found")
+        result = meta_for(records[0])
+        videos = {}
+        for record in records:
+            season, episode = record["season"], record["episode"]
+            videos.setdefault((season, episode), {
+                "id": f"{item_id}:{season}:{episode}", "title": f"S{season:02d}E{episode:02d}",
+                "season": season, "episode": episode, "released": record["posted_at"],
+                "available": True,
+            })
+        result["videos"] = list(videos.values())
+        return {"meta": result}
     record = await lookup_local(request, item_id) if media_type == "movie" else None
     if record is None:
         raise HTTPException(404, "Movie not found")
     return {"meta": meta_for(record)}
 
 
-@router.get("/stream/{media_type}/{item_id}.json")
-async def stream(request: Request, media_type: str, item_id: str):
-    if media_type != "movie":
-        return {"streams": []}
+async def stream_records(request: Request, media_type: str, item_id: str) -> list[dict]:
     db = request.app.state.db
     allowed = request.app.state.telegram.allowed_chats
-    if IMDB.fullmatch(item_id):
-        records = await db.by_imdb(item_id, allowed)
-    else:
+    if media_type == "movie":
+        if IMDB.fullmatch(item_id):
+            return await db.by_imdb(item_id, allowed)
         record = await lookup_local(request, item_id)
         if not record:
-            return {"streams": []}
-        records = await db.by_imdb(record["imdb_id"], allowed) if record["imdb_id"] else [record]
+            return []
+        return await db.by_imdb(record["imdb_id"], allowed) if record["imdb_id"] else [record]
+    if media_type == "series":
+        match = IMDB_EPISODE_ID.fullmatch(item_id)
+        if match:
+            return await db.by_imdb(match[1], allowed, "series", int(match[2]), int(match[3]))
+        match = LOCAL_EPISODE_ID.fullmatch(item_id)
+        if match:
+            return await db.series_files(match[1], allowed, int(match[2]), int(match[3]))
+        # Message-specific IDs remain usable for diagnostics and older clients.
+        record = await lookup_local(request, item_id, "series")
+        if record and record["season"] is not None and record["episode"] is not None:
+            return await db.series_files(
+                record["series_key"], allowed, record["season"], record["episode"]
+            )
+    return []
+
+
+@router.get("/stream/{media_type}/{item_id}.json")
+async def stream(request: Request, media_type: str, item_id: str):
+    records = await stream_records(request, media_type, item_id)
     settings = request.app.state.settings
     streams = []
     # Prefer the highest labeled resolution; file size breaks ties only.
@@ -124,4 +173,6 @@ async def stream(request: Request, media_type: str, item_id: str):
                 "notWebReady": True, "filename": record["filename"], "videoSize": record["size"],
             },
         })
+        if media_type == "series":
+            streams[-1]["behaviorHints"]["bingeGroup"] = f"telegram-{record['quality']}"
     return {"streams": streams}
