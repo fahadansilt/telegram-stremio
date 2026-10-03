@@ -1,0 +1,9 @@
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+Telethon==1.45.0
+cryptg==0.6.0
+cryptography==48.0.1
+aiosqlite==0.22.1
+httpx==0.28.1
+pydantic-settings==2.15.0
+guessit==3.8.0
